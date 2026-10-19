@@ -4,7 +4,7 @@
 # settles — in-process facilities a catalog "tool" plugin does not get.
 name: railway
 title: Railway
-version: 0.1.0
+version: 0.1.1
 kind: integration
 description: Railway for agents — projects, services and databases, deploys of a workspace folder that wake the agent when they settle, logs, variables, domains, redeploy and restart. The token stays in the plugin; agents never see it.
 agent_notes: Every call runs the Railway CLI (bundled, pinned) with the configured account/workspace token in a private HOME — no token in the agents' environment, no `railway login`. Deploys upload the folder (.gitignore respected), then the plugin follows the deployment and wakes the agent in its conversation when it settles, with the tail of the logs on failure.
@@ -17,8 +17,9 @@ config_schema:
       type: string
       title: Railway token
       secret: true
+      credential: RAILWAY_API_TOKEN
       placeholder: ${RAILWAY_API_TOKEN}
-      description: An account or workspace token (railway.com → Account Settings → Tokens, or the workspace's own settings) — not a project token. ${RAILWAY_API_TOKEN} reads it from the instance environment
+      description: An account or workspace token (railway.com → Account → Tokens, or the workspace's own settings) — not a project token. The same key as Settings → Integrations → Railway; ${RAILWAY_API_TOKEN} reads it from there
     workspace:
       type: string
       title: Workspace for new projects

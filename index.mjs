@@ -42,7 +42,7 @@ export default async function activate(ctx) {
   const defaultWorkspace = String(cfg.workspace ?? "").trim();
   const syncS = Math.min(170, Number(cfg.sync_s) > 0 ? Number(cfg.sync_s) : 120);
   if (!token) {
-    ctx.needsConfig("set a Railway account or workspace token (plugins.railway.config.api_token, or ${RAILWAY_API_TOKEN} in the environment)");
+    ctx.needsConfig("add a Railway account or workspace token in Settings → Integrations → Railway, or in this plugin's setup");
     return;
   }
   // the binary comes from @railway/cli's install script: an install that
