@@ -1,0 +1,32 @@
+# railway — Railway for Bridex agents, through the official Railway CLI.
+# kind MUST stay "integration": the plugin reads the agent's workspace to upload
+# a folder, watches deploys in the background and wakes the agent when one
+# settles — in-process facilities a catalog "tool" plugin does not get.
+name: railway
+title: Railway
+version: 0.1.0
+kind: integration
+description: Railway for agents — projects, services and databases, deploys of a workspace folder that wake the agent when they settle, logs, variables, domains, redeploy and restart. The token stays in the plugin; agents never see it.
+agent_notes: Every call runs the Railway CLI (bundled, pinned) with the configured account/workspace token in a private HOME — no token in the agents' environment, no `railway login`. Deploys upload the folder (.gitignore respected), then the plugin follows the deployment and wakes the agent in its conversation when it settles, with the tail of the logs on failure.
+entry: index.mjs
+config_schema:
+  type: object
+  required: [api_token]
+  properties:
+    api_token:
+      type: string
+      title: Railway token
+      secret: true
+      placeholder: ${RAILWAY_API_TOKEN}
+      description: An account or workspace token (railway.com → Account Settings → Tokens, or the workspace's own settings) — not a project token. ${RAILWAY_API_TOKEN} reads it from the instance environment
+    workspace:
+      type: string
+      title: Workspace for new projects
+      description: Name or ID of the Railway workspace new projects go to, when the token sees more than one
+    sync_s:
+      type: integer
+      title: Wait for a deploy inline up to, seconds
+      default: 120
+      minimum: 10
+      maximum: 170
+      description: A deploy that takes longer turns into a background job that wakes the agent when it settles
