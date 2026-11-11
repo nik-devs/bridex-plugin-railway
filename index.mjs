@@ -1,12 +1,19 @@
 /**
  * railway: Railway for Bridex agents, through the official Railway CLI.
  *
- * Every call runs the CLI bundled with the plugin (node_modules/@railway/cli,
- * pinned in package.json — its install step downloads the binary) with the
- * configured account/workspace token in RAILWAY_API_TOKEN and a private HOME
- * under the instance state. Agents never see the token: their shell has no
- * RAILWAY_* at all, and the environment the CLI gets is minimal, so the
- * instance's other secrets do not reach it either.
+ * The token is the instance's RAILWAY_API_TOKEN (Settings → Integrations →
+ * Railway), read on every call, so a key replaced there works at once. Every
+ * call runs the CLI bundled with the plugin (node_modules/@railway/cli, pinned
+ * in package.json — its install step downloads the binary) with that token and
+ * a private HOME under the instance state. Agents never see the token: their
+ * shell has no RAILWAY_* at all, and the environment the CLI gets is minimal,
+ * so the instance's other secrets do not reach it either.
+ *
+ * An account token and a workspace token both work. The CLI commands that list
+ * the user's workspaces (`list`, `link`, `init`) refuse a workspace token, so
+ * workspaces and projects come from Railway's public API, new projects are
+ * made with its projectCreate, and `add` gets its project through
+ * RAILWAY_PROJECT_ID / RAILWAY_ENVIRONMENT_ID instead of a link.
  *
  * A deploy uploads a folder of the calling agent's workspace (.gitignore
  * respected) with `railway up --detach`, finds the deployment it created and
@@ -22,7 +29,10 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const BIN = path.join(here, "node_modules", "@railway", "cli", "bin", process.platform === "win32" ? "railway.exe" : "railway");
+const API = "https://backboard.railway.com/graphql/v2";
 const TEXT_CAP = 6000;
+/** How long a deploy call waits inline before it turns into a background job. */
+const SYNC_S = 120;
 const POLL_MS = 5_000;
 const WATCH_MS = 15_000;
 const GIVE_UP_MS = 60 * 60_000;
@@ -36,15 +46,7 @@ const when = (iso) => String(iso ?? "").slice(0, 16).replace("T", " ");
 
 export default async function activate(ctx) {
   const { z, log } = ctx;
-  const cfg = ctx.config ?? {};
-  const resolve = (v) => String(v ?? "").replace(/\$\{([A-Z0-9_]+)\}/g, (_, n) => process.env[n] ?? "");
-  const token = resolve(cfg.api_token || "${RAILWAY_API_TOKEN}").trim();
-  const defaultWorkspace = String(cfg.workspace ?? "").trim();
-  const syncS = Math.min(170, Number(cfg.sync_s) > 0 ? Number(cfg.sync_s) : 120);
-  if (!token) {
-    ctx.needsConfig("add a Railway account or workspace token in Settings → Integrations → Railway, or in this plugin's setup");
-    return;
-  }
+  const syncS = SYNC_S;
   // the binary comes from @railway/cli's install script: an install that
   // skipped scripts leaves only the JS shim
   if (!fs.existsSync(BIN)) throw new Error(`the Railway CLI binary is missing (${BIN}) — reinstall the plugin: its npm install downloads the CLI`);
@@ -52,21 +54,48 @@ export default async function activate(ctx) {
   const home = path.join(ctx.paths.state, "plugins", "railway");
   fs.mkdirSync(home, { recursive: true });
 
+  /** The key from Settings → Integrations → Railway, as it is now (requires_env keeps the plugin idle without it). */
+  function token() {
+    const t = String(process.env.RAILWAY_API_TOKEN ?? "").trim();
+    if (!t) throw new Error("no Railway token — add one in Settings → Integrations → Railway");
+    return t;
+  }
   const clip = (s, n = TEXT_CAP) => (s.length > n ? `${s.slice(0, n)}\n… (${s.length - n} more characters)` : s);
-  const scrub = (s) => String(s ?? "").split(token).join("***");
+  const scrub = (s) => {
+    const t = String(process.env.RAILWAY_API_TOKEN ?? "").trim();
+    return t ? String(s ?? "").split(t).join("***") : String(s ?? "");
+  };
   const text = (t) => ({ content: [{ type: "text", text: scrub(t) }] });
   const fail = (e) => text(`error: ${e?.message ?? e}`);
+  const refused = "Railway refused the token in Settings → Integrations → Railway — it must be an account or workspace token (railway.com → Account → Tokens), not a project token";
+
+  /** Railway's public API: what the CLI cannot do with a workspace token. */
+  async function gql(query, variables = {}) {
+    const res = await fetch(API, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${token()}` },
+      body: JSON.stringify({ query, variables }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const j = await res.json().catch(() => null);
+    const errors = (j?.errors ?? []).map((e) => e.message);
+    if (res.status === 401 || errors.some((m) => /not authorized|unauthorized/i.test(m))) throw new Error(refused);
+    if (!res.ok || !j) throw new Error(`Railway API: HTTP ${res.status}`);
+    if (errors.length) throw new Error(`Railway API: ${errors.join("; ")}`);
+    return j.data;
+  }
 
   /** Run the CLI; resolves { code, out, err } and only rejects when it cannot start. */
-  function cli(args, { cwd = home, input = null, timeoutMs = 90_000 } = {}) {
+  function cli(args, { cwd = home, input = null, timeoutMs = 90_000, env: extra = {} } = {}) {
     return new Promise((res, rej) => {
       const env = {
         PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
         HOME: home,
         LANG: process.env.LANG ?? "C.UTF-8",
-        RAILWAY_API_TOKEN: token,
+        RAILWAY_API_TOKEN: token(),
         NO_COLOR: "1",
         DO_NOT_TRACK: "1",
+        ...extra,
       };
       const child = spawn(BIN, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
       let out = "";
@@ -107,13 +136,52 @@ export default async function activate(ctx) {
     }
   }
 
-  // -- projects by name or ID ----------------------------------------------
+  // -- workspaces and projects, through the API ----------------------------
+  /** The workspaces the token reaches: a workspace token its own one, an account token every workspace of the account. */
+  async function workspaces() {
+    let viaToken = [];
+    try {
+      viaToken = (await gql("{ apiToken { workspaces { id name } } }")).apiToken?.workspaces ?? [];
+    } catch (e) {
+      if (e.message !== refused) throw e;
+    }
+    if (viaToken.length) return viaToken;
+    // an account token that names no workspace of its own: the account's
+    return (await gql("{ me { workspaces { id name } } }")).me?.workspaces ?? [];
+  }
+  const PROJECT_FIELDS = "id name workspace { id name } environments { edges { node { id name } } } services { edges { node { id name } } }";
   let cache = { at: 0, list: [] };
   async function projects(fresh = false) {
     if (!fresh && Date.now() - cache.at < 30_000) return cache.list;
-    const list = await cliJson(["list"]);
-    cache = { at: Date.now(), list: Array.isArray(list) ? list : [] };
+    const list = [];
+    for (const w of await workspaces()) {
+      const d = await gql(`query($w: String!) { projects(workspaceId: $w, first: 200) { edges { node { ${PROJECT_FIELDS} } } } }`, { w: w.id });
+      list.push(...nodes(d.projects));
+    }
+    cache = { at: Date.now(), list };
     return cache.list;
+  }
+  /** A workspace by name or ID; without one, the only workspace the token reaches. */
+  async function workspaceId(name) {
+    const all = await workspaces();
+    const s = String(name ?? "").trim();
+    if (s) {
+      const hit = all.find((w) => w.id === s || w.name === s);
+      if (!hit) throw new Error(`no workspace «${s}» for this token — it reaches: ${all.map((w) => w.name).join(", ") || "none"}`);
+      return hit.id;
+    }
+    if (all.length === 1) return all[0].id;
+    if (!all.length) throw new Error("this token reaches no Railway workspace");
+    throw new Error(`the token reaches ${all.length} workspaces — name one in \`workspace\`: ${all.map((w) => w.name).join(", ")}`);
+  }
+  /** An environment's ID by name (the CLI's RAILWAY_ENVIRONMENT_ID wants the ID). */
+  async function environmentId(project, env) {
+    for (const fresh of [false, true]) {
+      const p = (await projects(fresh)).find((x) => x.id === project);
+      const e = nodes(p?.environments).find((x) => x.id === env || x.name === env);
+      if (e) return e.id;
+    }
+    throw new Error(`no environment «${env}» in this project — railway_projects lists them`);
   }
   async function projectId(p) {
     const s = String(p ?? "").trim();
@@ -293,7 +361,7 @@ export default async function activate(ctx) {
       name: z.string().optional().describe("project or service name"),
       project: z.string().optional().describe("project name or ID (for a service or a database)"),
       environment: z.string().optional().describe("default production"),
-      workspace: z.string().optional().describe("Railway workspace for a new project, when the token sees several"),
+      workspace: z.string().optional().describe("Railway workspace (name or ID) for a new project, when the token reaches several"),
       database: z.enum(["postgres", "mysql", "redis", "mongo"]).optional(),
       image: z.string().optional().describe("a service from a Docker image, e.g. nginx:latest"),
       repo: z.string().optional().describe("a service from a GitHub repo owner/name (the Railway GitHub app must reach it)"),
@@ -303,24 +371,25 @@ export default async function activate(ctx) {
       try {
         if (a.kind === "project") {
           if (!a.name) throw new Error("name the project");
-          const ws = a.workspace || defaultWorkspace;
-          const r = await cliJson(["init", "--name", a.name, ...(ws ? ["--workspace", ws] : [])]);
+          // `railway init` lists the user's workspaces first, which a workspace token may not: the same mutation, directly
+          const d = await gql("mutation($input: ProjectCreateInput!) { projectCreate(input: $input) { id name environments { edges { node { name } } } } }", {
+            input: { name: a.name, workspaceId: await workspaceId(a.workspace) },
+          });
           cache.at = 0;
-          return text(`project «${a.name}» created: ${clip(JSON.stringify(r), 1200)}`);
+          const p = d.projectCreate;
+          return text(`project «${p.name}» created (${p.id}); environments: ${nodes(p.environments).map((e) => e.name).join(", ") || "—"}`);
         }
         if (a.kind === "service" && !a.name) throw new Error("name the service");
         const id = await projectId(a.project);
         const env = a.environment || "production";
-        // `railway add` works on a linked directory only: one per project and environment, in the plugin's HOME
-        const dir = path.join(home, "links", `${id}-${env}`.replace(/[^\w.-]/g, "_"));
-        fs.mkdirSync(dir, { recursive: true });
-        const ln = await cli(["link", "--project", id, "--environment", env, "--json"], { cwd: dir });
-        if (ln.code !== 0) throw new Error(`link: ${cliError(ln)}`);
+        // `railway add` acts on the linked project; `railway link` lists the user's workspaces, which a
+        // workspace token may not — the CLI takes the project from these variables instead
+        const where = { RAILWAY_PROJECT_ID: id, RAILWAY_ENVIRONMENT_ID: await environmentId(id, env) };
         const args =
           a.kind === "database"
             ? ["add", "--database", a.database ?? "postgres"]
             : ["add", "--service", a.name, ...(a.image ? ["--image", a.image] : []), ...(a.repo ? ["--repo", a.repo, ...(a.branch ? ["--branch", a.branch] : [])] : [])];
-        const r = await cliJson(args, { cwd: dir, timeoutMs: 180_000 });
+        const r = await cliJson(args, { env: where, timeoutMs: 180_000 });
         cache.at = 0;
         return text(`${a.kind === "database" ? `${a.database ?? "postgres"} database` : `service «${a.name}»`} created in ${id} (${env}): ${clip(JSON.stringify(r), 1200)}`);
       } catch (e) {
@@ -495,7 +564,8 @@ export default async function activate(ctx) {
     ctx.registerCheck(async () => {
       try {
         const list = await projects(true);
-        return { ok: true, message: `the token works — ${list.length} project(s) visible` };
+        const where = [...new Set(list.map((p) => p.workspace?.name).filter(Boolean))];
+        return { ok: true, message: `the token works — ${list.length} project(s)${where.length ? ` in ${where.join(", ")}` : ""}` };
       } catch (e) {
         return { ok: false, message: scrub(e.message) };
       }

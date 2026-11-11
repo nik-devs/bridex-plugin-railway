@@ -1,6 +1,7 @@
 {
   "name": "bridex-plugin-railway",
   "private": true,
+  "version": "0.2.0",
   "type": "module",
   "dependencies": {
     "@railway/cli": "5.70.0"
